@@ -82,6 +82,30 @@ def draw_boxes_cv2(img_np, df, cv2):
                     cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2, cv2.LINE_AA)
     return out
 
+# --- Compliance helper (small drop-in function) ---
+def get_compliance(detections):
+    """Return (status_label, missing_list). detections = list of class names."""
+    names = set(detections)
+    required = ['Hardhat', 'Mask', 'Safety Vest']
+
+    # presence / explicit NO- flags
+    present = {p: (p in names) for p in required}
+    explicit_no = {p: (f"NO-{p}" in names) for p in required}
+
+    # Status logic
+    if all(present.values()) and not any(explicit_no.values()):
+        status = "🟢 Fully Compliant"
+    elif all(explicit_no.values()) and not any(present.values()):
+        status = "🔴 Non-Compliant"
+    else:
+        status = "🟡 Partially Compliant"
+
+    # Determine what's missing (either explicit NO- or simply not detected)
+    missing = [p for p in required if explicit_no[p] or not present[p]]
+
+    return status, missing
+# --- end compliance helper ---
+
 if uploaded_file:
     img = Image.open(uploaded_file).convert("RGB")
     st.image(img, caption="Uploaded Image", use_column_width=True)
@@ -96,6 +120,17 @@ if uploaded_file:
             except Exception as e:
                 st.error("Inference failed: " + str(e))
                 st.stop()
+
+        # ---------- PLACE WHERE COMPLIANCE CHECK IS RUN ----------
+        # use model outputs to decide Fully / Partially / Non-compliant
+        detections = df['name'].tolist() if not df.empty else []
+        status, missing = get_compliance(detections)
+        st.markdown(f"### Compliance Status: **{status}**")
+        if missing:
+            st.write("**Missing / Not detected:**", ", ".join(missing))
+        else:
+            st.write("All required PPE detected ✅")
+        # ---------------------------------------------------------
 
         # annotate and display
         if cv2 is not None:
