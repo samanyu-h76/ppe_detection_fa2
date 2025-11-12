@@ -23,7 +23,7 @@ compliance_map = {
     'Safety Cone': '🟠 Cone'
 }
 
-MODEL_PATH = "best.pt"  # ensure this exists in repo root or change to URL
+MODEL_PATH = "best_ppe.pt"  # ensure this exists in repo root or change to URL
 
 # lazy cv2 importer (won't crash app if cv2 / native libs missing)
 def try_import_cv2():
