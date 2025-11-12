@@ -170,7 +170,7 @@ with col1:
         st.image(img, caption="Uploaded Image", use_column_width=True)
 
         with st.spinner("Running detection..."):
-            results = model(img)  # model handles PIL Image
+            results = model(img, size=640)# model handles PIL Image
             # annotated image
             rendered = results.render()[0]  # numpy array BGR? typically RGB-like; convert if needed
             # convert numpy to PIL for display (results.render() returns ndarray uint8)
