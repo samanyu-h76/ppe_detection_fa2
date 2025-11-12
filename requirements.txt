@@ -1,25 +1,8 @@
-# Core
-streamlit==1.40.2
-pillow==10.4.0
-numpy==1.26.4
-pandas==2.2.3
-requests==2.32.3
-pyyaml==6.0.2
-
-# PyTorch + YOLOv5 runtime (CPU inference fine)
-torch==2.2.2
-torchvision==0.17.2
-
-# OpenCV (headless build = no GUI deps = no libGL errors)
-opencv-python-headless==4.9.0.80
-
-# YOLOv5 dependencies
-matplotlib==3.9.2
-tqdm==4.66.5
-seaborn==0.13.2
-
-# Misc (sometimes required by torch.hub models)
-ultralytics==8.2.85
-
-# Optional: suppress certain numpy/tensor conflicts
-typing-extensions==4.12.2
+streamlit
+torch
+opencv-python-headless
+Pillow
+tqdm
+seaborn
+pandas
+ultralytics
