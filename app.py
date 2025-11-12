@@ -32,12 +32,24 @@ SYNONYMS = {
 }
 
 @st.cache_resource(show_spinner=False)
-def load_model(path=MODEL_PATH):
-    if not os.path.exists(path):
-        st.error(f"Model file '{path}' not found. Upload it to the repo or same folder.")
+def load_model():
+    import sys
+    from pathlib import Path
+
+    # make sure repo code can import YOLOv5
+    yolov5_path = Path("yolov5")
+    if not yolov5_path.exists():
+        os.system("git clone https://github.com/ultralytics/yolov5.git > /dev/null 2>&1")
+    sys.path.append(str(yolov5_path))
+
+    from models.common import DetectMultiBackend
+
+    if not os.path.exists(MODEL_PATH):
+        st.error(f"Model file '{MODEL_PATH}' not found! Make sure it's uploaded.")
         st.stop()
-    # using torch.hub load of ultralytics - will load custom model
-    model = torch.hub.load('ultralytics/yolov5', 'custom', path=path, force_reload=False)
+
+    device = 'cpu'  # Streamlit Cloud doesn't support GPU
+    model = DetectMultiBackend(MODEL_PATH, device=device)
     return model
 
 def normalize_name(name):
