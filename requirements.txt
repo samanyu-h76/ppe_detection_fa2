@@ -1,8 +1,9 @@
-streamlit
+streamlit>=1.24
 torch==2.5.1
 torchvision==0.20.1
+numpy==1.26.4
 opencv-python-headless==4.9.0.80
 Pillow
-numpy==1.26.4
 pandas
-ultralytics
+tqdm
+PyYAML
