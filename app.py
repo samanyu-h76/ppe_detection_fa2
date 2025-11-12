@@ -36,19 +36,28 @@ def load_model():
     import sys
     from pathlib import Path
 
-    # make sure repo code can import YOLOv5
+    # ensure yolov5 code is available
     yolov5_path = Path("yolov5")
     if not yolov5_path.exists():
         os.system("git clone https://github.com/ultralytics/yolov5.git > /dev/null 2>&1")
     sys.path.append(str(yolov5_path))
 
+    # quick cv2 check to show readable error
+    try:
+        import cv2
+    except Exception as e:
+        st.error("OpenCV import failed in this environment. Make sure requirements.txt contains 'opencv-python-headless==4.9.0.80' and numpy is pinned.")
+        st.write("Detailed error:", str(e))
+        st.stop()
+
+    # import DetectMultiBackend after yolov5 is in path
     from models.common import DetectMultiBackend
 
     if not os.path.exists(MODEL_PATH):
-        st.error(f"Model file '{MODEL_PATH}' not found! Make sure it's uploaded.")
+        st.error(f"Model file '{MODEL_PATH}' not found! Upload it to repo root.")
         st.stop()
 
-    device = 'cpu'  # Streamlit Cloud doesn't support GPU
+    device = 'cpu'  # Streamlit Cloud has no GPU
     model = DetectMultiBackend(MODEL_PATH, device=device)
     return model
 
