@@ -1,18 +1,15 @@
+# app.py (safe version) — drop-in replacement
 import streamlit as st
-from PIL import Image
+from PIL import Image, ImageDraw, ImageFont
 import torch
-import cv2
 import numpy as np
-import tempfile
+import io
+import os
 
-# Load model
-@st.cache_resource
-def load_model():
-    return torch.hub.load('ultralytics/yolov5', 'custom', path='best_ppe.pt')
+st.set_page_config(page_title="PPE Compliance Detector", layout="centered")
+st.title("🛠️ PPE Compliance Detection")
 
-model = load_model()
-
-# Compliance map
+# small map kept from your original
 compliance_map = {
     'Hardhat': '✅ Compliant',
     'Safety Vest': '✅ Compliant',
@@ -26,35 +23,104 @@ compliance_map = {
     'Safety Cone': '🟠 Cone'
 }
 
-# UI
-st.set_page_config(page_title="PPE Compliance Detector", layout="centered")
-st.title("🛠️ PPE Compliance Detection")
-st.markdown("Upload a construction site image to detect workers and check PPE compliance.")
+MODEL_PATH = "best.pt"  # ensure this exists in repo root or change to URL
 
-uploaded_file = st.file_uploader("📷 Upload Image", type=["jpg", "jpeg", "png"])
+# lazy cv2 importer (won't crash app if cv2 / native libs missing)
+def try_import_cv2():
+    try:
+        import cv2
+        return cv2
+    except Exception:
+        return None
+
+cv2 = try_import_cv2()
+
+# safe model loader (gives readable errors)
+@st.cache_resource(show_spinner=False)
+def load_model(path=MODEL_PATH):
+    if not os.path.exists(path):
+        raise FileNotFoundError(f"Model file not found at '{path}'. Put your best.pt in repo root or provide a URL and change MODEL_PATH.")
+    try:
+        # load via torch.hub (ultralytics yolov5)
+        return torch.hub.load('ultralytics/yolov5', 'custom', path=path, force_reload=False)
+    except Exception as e:
+        raise RuntimeError("Model load failed: " + str(e))
+
+# try to load model, show friendly message if fails
+model = None
+try:
+    model = load_model()
+except Exception as e:
+    st.error("Model load: " + str(e))
+    st.info("You can still upload an image, but detection won't run until model is loaded successfully.")
+    # we do not stop here so you can still view UI
+
+uploaded_file = st.file_uploader("Upload an image (jpg/png)", type=["jpg","jpeg","png"])
+
+def draw_boxes_pil(img_pil, df):
+    draw = ImageDraw.Draw(img_pil)
+    try:
+        font = ImageFont.truetype("DejaVuSans.ttf", 14)
+    except Exception:
+        font = ImageFont.load_default()
+    for _, row in df.iterrows():
+        x1, y1, x2, y2 = map(int, [row['xmin'], row['ymin'], row['xmax'], row['ymax']])
+        label = row['name']
+        color = (0,255,0) if not str(label).startswith('NO-') else (255,0,0)
+        draw.rectangle([x1,y1,x2,y2], outline=color, width=2)
+        draw.text((x1, max(0,y1-12)), compliance_map.get(label, label), fill=color, font=font)
+    return img_pil
+
+def draw_boxes_cv2(img_np, df, cv2):
+    out = img_np.copy()
+    for _, row in df.iterrows():
+        x1, y1, x2, y2 = map(int, [row['xmin'], row['ymin'], row['xmax'], row['ymax']])
+        label = row['name']
+        color = (0,255,0) if not str(label).startswith('NO-') else (0,0,255)  # BGR
+        cv2.rectangle(out, (x1,y1),(x2,y2), color, 2)
+        cv2.putText(out, compliance_map.get(label, label), (x1, max(10,y1-10)),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2, cv2.LINE_AA)
+    return out
 
 if uploaded_file:
-    image = Image.open(uploaded_file).convert("RGB")
-    st.image(image, caption="Original Image", use_column_width=True)
+    img = Image.open(uploaded_file).convert("RGB")
+    st.image(img, caption="Uploaded Image", use_column_width=True)
 
-    with st.spinner("Detecting..."):
-        results = model(image)
-        df = results.pandas().xyxy[0]
+    if model is None:
+        st.warning("Model not loaded — detection skipped. Fix model (best.pt) or check logs.")
+    else:
+        with st.spinner("Running detection..."):
+            try:
+                results = model(img)
+                df = results.pandas().xyxy[0]
+            except Exception as e:
+                st.error("Inference failed: " + str(e))
+                st.stop()
 
-        # Annotate image
-        annotated_img = np.array(image)
-        for _, row in df.iterrows():
-            label = row['name']
-            x1, y1, x2, y2 = map(int, [row['xmin'], row['ymin'], row['xmax'], row['ymax']])
-            color = (0, 255, 0) if 'NO-' not in label else (255, 0, 0)
-            cv2.rectangle(annotated_img, (x1, y1), (x2, y2), color, 2)
-            cv2.putText(annotated_img, compliance_map.get(label, label), (x1, y1 - 10),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
+        # annotate and display
+        if cv2 is not None:
+            # convert PIL to numpy BGR for cv2 drawing
+            arr = np.array(img)  # RGB
+            bgr = arr[..., ::-1]
+            annotated_bgr = draw_boxes_cv2(bgr, df, cv2)
+            annotated_rgb = annotated_bgr[..., ::-1]
+            st.image(annotated_rgb, caption="🧠 Detection Result (cv2)", use_column_width=True)
+            # optional download
+            buf = io.BytesIO()
+            Image.fromarray(annotated_rgb).save(buf, format="PNG")
+            buf.seek(0)
+            st.download_button("Download annotated image", data=buf, file_name="annotated.png", mime="image/png")
+        else:
+            # PIL drawing fallback
+            annotated = draw_boxes_pil(img.copy(), df)
+            st.image(annotated, caption="🧠 Detection Result (PIL fallback)", use_column_width=True)
+            buf = io.BytesIO()
+            annotated.save(buf, format="PNG")
+            buf.seek(0)
+            st.download_button("Download annotated image", data=buf, file_name="annotated.png", mime="image/png")
 
-        st.image(annotated_img, caption="🧠 Detection Result", use_column_width=True)
-
-        # Summary
-        st.subheader("📋 Compliance Summary")
-        for label in df['name'].unique():
-            count = (df['name'] == label).sum()
-            st.write(f"{compliance_map.get(label, label)}: {count}")
+        # summary
+        st.subheader("Compliance summary")
+        counts = df['name'].value_counts()
+        for label, cnt in counts.items():
+            st.write(f"{compliance_map.get(label, label)}: {cnt}")
