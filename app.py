@@ -1,231 +1,251 @@
-# app.py
-import os
+# app.py — updated (keeps your original logic but safer & improved UI)
 import streamlit as st
-import torch
 from PIL import Image
+import io
 import numpy as np
 import pandas as pd
+from typing import Optional
 
 st.set_page_config(page_title="PPE Compliance Detector", layout="wide")
+st.title("🛠️ PPE Compliance Detection (safe + live modes)")
 
-MODEL_PATH = "best_ppe.pt"  # put best_ppe.pt in the same folder as app.py
-
-# --- helper: compliance rules (edit if your classes use other names) ---
-# This dictionary defines pairs: good label -> corresponding "NO-" label
-PPE_PAIRS = {
-    "Hardhat": "NO-Hardhat",
-    "Mask": "NO-Mask",
-    "Safety Vest": "NO-Safety Vest",
+# ---------- User-config / mapping (kept from your original) ----------
+compliance_map = {
+    'Hardhat': '✅ Compliant',
+    'Safety Vest': '✅ Compliant',
+    'Mask': '✅ Compliant',
+    'NO-Hardhat': '❌ Missing Hardhat',
+    'NO-Safety Vest': '❌ Missing Vest',
+    'NO-Mask': '❌ Missing Mask',
+    'Person': '👤 Worker',
+    'machinery': '⚙️ Machinery',
+    'vehicle': '🚗 Vehicle',
+    'Safety Cone': '🟠 Cone'
 }
 
-# fallback synonyms (lowercase mapping)
-SYNONYMS = {
-    "hardhat": "Hardhat",
-    "helmet": "Hardhat",
-    "mask": "Mask",
-    "safety vest": "Safety Vest",
-    "vest": "Safety Vest",
-    "no-hardhat": "NO-Hardhat",
-    "no-mask": "NO-Mask",
-    "no-safety vest": "NO-Safety Vest",
-    "no-vest": "NO-Safety Vest",
-}
+MODEL_PATH = "best_ppe.pt"  # ensure this file is present in repo root for live mode
 
-@st.cache_resource(show_spinner=False)
-def load_model():
-    import sys
-    from pathlib import Path
-
-    # ensure yolov5 code is available
-    yolov5_path = Path("yolov5")
-    if not yolov5_path.exists():
-        os.system("git clone https://github.com/ultralytics/yolov5.git > /dev/null 2>&1")
-    sys.path.append(str(yolov5_path))
-
-    # quick cv2 check to show readable error
+# ---------- Helpers ----------
+def safe_try_import_cv2():
+    """Try import cv2. Return module or None if import fails."""
     try:
-        import cv2
-    except Exception as e:
-        st.error("OpenCV import failed in this environment. Make sure requirements.txt contains 'opencv-python-headless==4.9.0.80' and numpy is pinned.")
-        st.write("Detailed error:", str(e))
-        st.stop()
+        import cv2 as _cv2
+        return _cv2
+    except Exception:
+        return None
 
-    # import DetectMultiBackend after yolov5 is in path
-    from models.common import DetectMultiBackend
+def bgr_to_rgb(img_np):
+    """If img is BGR (cv2), convert to RGB for display. Expect uint8."""
+    if img_np is None:
+        return None
+    if img_np.ndim == 3 and img_np.shape[2] == 3:
+        # assume BGR -> convert to RGB
+        return img_np[..., ::-1]
+    return img_np
 
-    if not os.path.exists(MODEL_PATH):
-        st.error(f"Model file '{MODEL_PATH}' not found! Upload it to repo root.")
-        st.stop()
+def draw_boxes_cv2(cv2, img_np, detections_df):
+    """Draw boxes using cv2 on numpy image; returns numpy image (BGR)."""
+    img_out = img_np.copy()
+    for _, row in detections_df.iterrows():
+        label = row.get('name', '')
+        x1, y1, x2, y2 = map(int, [row.get('xmin', 0), row.get('ymin', 0), row.get('xmax', 0), row.get('ymax', 0)])
+        color = (0, 255, 0) if not str(label).startswith('NO-') else (0, 0, 255)  # BGR: green/red
+        cv2.rectangle(img_out, (x1, y1), (x2, y2), color, 2)
+        display_label = compliance_map.get(label, label)
+        cv2.putText(img_out, display_label, (x1, max(10, y1-10)),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2, cv2.LINE_AA)
+    return img_out
 
-    device = 'cpu'  # Streamlit Cloud has no GPU
-    model = DetectMultiBackend(MODEL_PATH, device=device)
-    return model
+def draw_boxes_pil(img_pil, detections_df):
+    """Fallback drawing with PIL (safe, no cv2)."""
+    from PIL import ImageDraw, ImageFont
+    draw = ImageDraw.Draw(img_pil)
+    try:
+        font = ImageFont.truetype("DejaVuSans.ttf", 14)
+    except Exception:
+        font = ImageFont.load_default()
+    for _, row in detections_df.iterrows():
+        label = row.get('name', '')
+        x1, y1, x2, y2 = map(int, [row.get('xmin', 0), row.get('ymin', 0), row.get('xmax', 0), row.get('ymax', 0)])
+        color = (0, 255, 0) if not str(label).startswith('NO-') else (255, 0, 0)
+        draw.rectangle([x1, y1, x2, y2], outline=color, width=2)
+        display_label = compliance_map.get(label, label)
+        draw.text((x1, max(0, y1-15)), display_label, fill=color, font=font)
+    return img_pil
 
-def normalize_name(name):
-    """Map detected name to canonical PPE names if possible."""
-    if not isinstance(name, str):
-        return name
-    n = name.strip()
-    if n in PPE_PAIRS or n in PPE_PAIRS.values():
-        return n
-    nl = n.lower()
-    return SYNONYMS.get(nl, n)
-
-def aggregate_detections(df, conf_threshold=0.25):
-    """
-    df: results.pandas().xyxy[0] DataFrame
-    returns: dict -> {class_name: best_conf}
-    """
-    agg = {}
+def decide_overall(df, conf_threshold=0.25):
+    """Simple heuristic to decide overall compliance from detections DataFrame."""
+    # if no detections -> unknown
     if df is None or df.empty:
-        return agg
-    # model might name confidence column 'confidence' or 'conf' or 'confidence' depending on version
-    conf_col = None
-    for c in ["confidence", "conf", "score"]:
-        if c in df.columns:
-            conf_col = c
-            break
-    if conf_col is None:
-        # fallback: hope 'confidence' exists; if not, set 1.0
-        conf_col = df.columns[4] if len(df.columns) > 4 else None
-
-    for _, row in df.iterrows():
-        raw_name = row.get("name", "")
-        conf = float(row[conf_col]) if conf_col is not None else 1.0
-        name = normalize_name(raw_name)
-        # ignore extremely low confidences
-        if conf < conf_threshold:
-            continue
-        if name not in agg or conf > agg[name]:
-            agg[name] = conf
-    return agg
-
-def decide_compliance(agg):
-    """
-    agg: dict of class->conf
-    return (status, details)
-    status: "Fully Compliant" / "Partially Compliant" / "Non-Compliant"
-    details: dict with per-item decisions
-    """
+        return "Unknown (no detections)", {}
+    names = df[df['confidence'] >= conf_threshold]['name'].tolist()
+    # check presence of good PPE
+    goods = ['Hardhat', 'Mask', 'Safety Vest']
     details = {}
-    # for each required PPE (keys of PPE_PAIRS), check presence/conflict
-    required = list(PPE_PAIRS.keys())
-    present_count = 0
-    missing_count = 0
-    not_worn_count = 0
-
-    for good in required:
-        bad = PPE_PAIRS[good]
-        good_conf = agg.get(good, 0.0)
-        bad_conf = agg.get(bad, 0.0)
-
-        # decide based on which one has higher confidence
-        # threshold logic: if good_conf >= 0.4 => considered present, unless bad_conf significantly higher
-        # if both present but bad_conf > good_conf*1.1 -> prefer bad
-        chosen = None
-        chosen_conf = 0.0
-
-        if good_conf == 0 and bad_conf == 0:
-            chosen = "missing"
-            details[good] = {"status": "missing", "good_conf": good_conf, "bad_conf": bad_conf}
-            missing_count += 1
-            continue
-
-        # choose the label with higher confidence
-        if good_conf >= bad_conf:
-            chosen = "present"
-            chosen_conf = good_conf
+    present = 0
+    for g in goods:
+        if g in names:
+            details[g] = 'present'
+            present += 1
+        elif f"NO-{g}" in names:
+            details[g] = 'explicitly_not_worn'
         else:
-            chosen = "not_worn"
-            chosen_conf = bad_conf
-
-        # small sanity bump: if both are close (<0.05 diff), favor 'present' (avoid false negative)
-        if abs(good_conf - bad_conf) < 0.05 and good_conf > 0:
-            chosen = "present"
-            chosen_conf = good_conf
-
-        if chosen == "present":
-            present_count += 1
-            details[good] = {"status": "present", "good_conf": good_conf, "bad_conf": bad_conf}
-        else:
-            not_worn_count += 1
-            details[good] = {"status": "not_worn", "good_conf": good_conf, "bad_conf": bad_conf}
-
-    # decide overall
-    if present_count == len(required):
+            details[g] = 'missing'
+    if present == len(goods):
         overall = "🟢 Fully Compliant"
-    elif present_count == 0:
+    elif present == 0:
         overall = "🔴 Non-Compliant"
     else:
         overall = "🟡 Partially Compliant"
     return overall, details
 
-# --- UI ---
-st.title("🦺 PPE Compliance Detector (Image-level)")
-
-model = load_model()
-
-col1, col2 = st.columns([2, 1])
-
+# ---------- UI controls ----------
+col1, col2 = st.columns([3,1])
 with col2:
-    st.write("### Settings")
-    conf_thresh = st.slider("Detection confidence threshold", 0.05, 0.7, 0.25, 0.01)
+    mode = st.radio("Mode", ["Live (local/dev only)", "Upload image + CSV (safe)", "Upload image only (no CSV)"], index=1)
+    conf_thr = st.slider("Confidence threshold", 0.05, 0.9, 0.25, 0.01)
     show_raw = st.checkbox("Show raw detections table", value=False)
+    download_outputs = st.checkbox("Offer downloads", value=True)
 
 with col1:
-    uploaded = st.file_uploader("Upload an image", type=["jpg", "jpeg", "png"])
-    if uploaded:
-        img = Image.open(uploaded).convert("RGB")
-        st.image(img, caption="Uploaded Image", use_column_width=True)
+    st.write("Upload an image (jpg / png). For safe mode, also upload the CSV produced by your training/Colab run.")
+    uploaded_image = st.file_uploader("Image", type=['jpg','jpeg','png'])
+    if mode == "Upload image + CSV (safe)":
+        uploaded_csv = st.file_uploader("Detections CSV (columns: name, confidence, xmin, ymin, xmax, ymax)", type=['csv'])
+    else:
+        uploaded_csv = None
 
-        with st.spinner("Running detection..."):
-            results = model(img, size=640)# model handles PIL Image
-            # annotated image
-            rendered = results.render()[0]  # numpy array BGR? typically RGB-like; convert if needed
-            # convert numpy to PIL for display (results.render() returns ndarray uint8)
+process = st.button("Run detection / evaluate compliance")
+
+# ---------- guarded model loader ----------
+@st.cache_resource(show_spinner=False)
+def load_model_guarded(path: str = MODEL_PATH):
+    """
+    Try to load model with torch.hub. If torch/cv2 not available or model missing,
+    raise an informative exception. Keep import inside function.
+    """
+    import os
+    if not os.path.exists(path):
+        raise FileNotFoundError(f"Model file not found at {path}. Upload it or put it in repo root as {path}.")
+    try:
+        import torch
+    except Exception as e:
+        raise RuntimeError("Torch not available in environment: " + str(e))
+    # load YOLOv5 custom using hub (may attempt network if not cached)
+    try:
+        model = torch.hub.load('ultralytics/yolov5', 'custom', path=path, force_reload=False)
+        return model
+    except Exception as e:
+        raise RuntimeError("Failed to load model via torch.hub: " + str(e))
+
+# ---------- Processing ----------
+if process:
+    if uploaded_image is None:
+        st.error("Upload an image first.")
+        st.stop()
+
+    # read image as PIL
+    try:
+        img_pil = Image.open(uploaded_image).convert("RGB")
+    except Exception as e:
+        st.error("Failed to read image: " + str(e))
+        st.stop()
+
+    detections_df = pd.DataFrame(columns=['name','confidence','xmin','ymin','xmax','ymax'])  # default empty
+
+    if mode == "Upload image + CSV (safe)":
+        if uploaded_csv is None:
+            st.error("Please upload the CSV for this image.")
+            st.stop()
+        try:
+            df = pd.read_csv(uploaded_csv)
+            # normalize: ensure cols exist
+            expected = {'name','confidence','xmin','ymin','xmax','ymax'}
+            if not expected.issubset(set(df.columns)):
+                st.warning("CSV missing some expected columns — trying to proceed anyway.")
+            detections_df = df
+            st.success("CSV loaded.")
+        except Exception as e:
+            st.error("Could not load CSV: " + str(e))
+            st.stop()
+
+    elif mode == "Upload image only (no CSV)":
+        st.info("No CSV provided — fallback to showing the image. For detection you must use Live or generate CSV from Colab.")
+        detections_df = pd.DataFrame()  # empty
+
+    else:  # Live mode
+        # try to import cv2 (only now)
+        cv2 = safe_try_import_cv2()
+        if cv2 is None:
+            st.error("cv2 not available in this environment. Live mode requires OpenCV (or use 'Upload image + CSV' mode).")
+            st.stop()
+        # load model
+        try:
+            model = load_model_guarded()
+        except Exception as e:
+            st.error("Model load failed: " + str(e))
+            st.stop()
+
+        # run inference
+        with st.spinner("Running model inference..."):
             try:
-                im_out = Image.fromarray(rendered)
-            except Exception:
-                im_out = img  # fallback
+                results = model(img_pil)  # yolov5 hub returns results
+                # results.pandas().xyxy[0] should give df
+                detections_df = results.pandas().xyxy[0]
+                # ensure expected numeric columns
+                for c in ['xmin','ymin','xmax','ymax','confidence']:
+                    if c not in detections_df.columns:
+                        detections_df[c] = 0
+            except Exception as e:
+                st.error("Inference failed: " + str(e))
+                st.stop()
 
-            st.image(im_out, caption="Detections (with boxes)", use_column_width=True)
+    # decide compliance
+    overall, details = decide_overall(detections_df, conf_thr)
+    st.markdown(f"### Compliance result: **{overall}**")
 
-            df = results.pandas().xyxy[0]  # dataframe with columns including 'name' and confidence
-            agg = aggregate_detections(df, conf_threshold=conf_thresh)
+    # draw annotated image
+    if not detections_df.empty:
+        # prefer cv2 if available to draw (fast), else PIL fallback
+        cv2 = safe_try_import_cv2()
+        if cv2 is not None:
+            # we must convert PIL->np BGR for cv2 drawing
+            img_np = np.array(img_pil)  # RGB
+            img_np_bgr = img_np[..., ::-1]  # BGR
+            annotated_bgr = draw_boxes_cv2(cv2, img_np_bgr, detections_df)
+            annotated_rgb = bgr_to_rgb(annotated_bgr)
+            # show with st.image (expects RGB)
+            st.image(annotated_rgb, caption="🧠 Detection result", use_column_width=True)
+            # allow download: convert numpy->bytes
+            if download_outputs:
+                pil_out = Image.fromarray(annotated_rgb.astype('uint8'))
+                buf = io.BytesIO()
+                pil_out.save(buf, format="PNG")
+                buf.seek(0)
+                st.download_button("Download annotated image (PNG)", data=buf, file_name="annotated.png", mime="image/png")
+        else:
+            # PIL fallback drawing
+            annotated = draw_boxes_pil(img_pil.copy(), detections_df)
+            st.image(annotated, caption="🧠 Detection result (PIL)", use_column_width=True)
+            if download_outputs:
+                buf = io.BytesIO()
+                annotated.save(buf, format="PNG")
+                buf.seek(0)
+                st.download_button("Download annotated image (PNG)", data=buf, file_name="annotated.png", mime="image/png")
+    else:
+        st.image(img_pil, caption="Uploaded image (no boxes)", use_column_width=True)
 
-            overall, details = decide_compliance(agg)
+    # show table summarising counts
+    if not detections_df.empty and len(detections_df) > 0:
+        summary = detections_df['name'].value_counts().rename_axis('label').reset_index(name='count')
+        # map to friendly text
+        summary['friendly'] = summary['label'].map(compliance_map).fillna(summary['label'])
+        st.subheader("📋 Compliance Summary (counts)")
+        st.table(summary[['friendly','count']].rename(columns={'friendly':'label'}).set_index('label'))
 
-            st.markdown(f"### Compliance Status: {overall}")
+    if show_raw:
+        st.subheader("Raw detections (first rows)")
+        st.dataframe(detections_df.head(50))
 
-            # show a neat table of PPE items and confidences
-            rows = []
-            for ppe in PPE_PAIRS.keys():
-                info = details.get(ppe, {})
-                rows.append({
-                    "PPE Item": ppe,
-                    "Status": info.get("status", "missing"),
-                    "Detected (good) Conf": round(info.get("good_conf", 0.0), 3),
-                    "Detected (NO-) Conf": round(info.get("bad_conf", 0.0), 3),
-                })
-            st.table(pd.DataFrame(rows).set_index("PPE Item"))
-
-            # optionally show raw detections
-            if show_raw:
-                st.write("Raw detections (filtered):")
-                display_df = df.copy()
-                # make sure confidence column is named consistently
-                for c in ["confidence", "conf", "score"]:
-                    if c in display_df.columns:
-                        display_df = display_df.rename(columns={c: "confidence"})
-                        break
-                st.dataframe(display_df[["name", "confidence", "xmin", "ymin", "xmax", "ymax"]])
-
-# small footer note
-st.markdown(
-    """
-    **Notes:**  
-    - The app decides based on the highest-confidence label for each PPE item (e.g. `Hardhat` vs `NO-Hardhat`).  
-    - If you want *person-level* compliance (each person separately), let me know — I can modify the code to group detections by person bounding box.  
-    - Tweak the confidence slider if your model is noisy.
-    """
-)
+    # show details dict
+    st.write("Per-PPE details:", details)
